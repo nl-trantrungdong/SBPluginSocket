@@ -1,5 +1,6 @@
 using Extreme.Net;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using PluginFramework;
 using PluginFramework.Attributes;
 using RuriLib;
@@ -17,10 +18,8 @@ namespace WebSocketMessagePack
     public class WebSocketMessagePackPlugin : BlockBase, IBlockPlugin, IDisposable
     {
         private string variableName = "";
-        private string username = "";
-        private string password = "";
-        private string info = "";
-         private string signature = "";
+        private string wsUrl = "";
+        private string token = "";
         private string timeout = "30000";
     
         private bool disposed = false;
@@ -78,29 +77,18 @@ namespace WebSocketMessagePack
             set { this.variableName = value; this.OnPropertyChanged("VariableName"); }
         }
 
-        [Text("Username:", "Username for auth")]
-        public string Username
+        [Text("WS Url:", "WebSocket URL (e.g., wss://websocket.azhkthg1.net/wsbinary?token=)")]
+        public string WsUrl
         {
-            get { return this.username; }
-            set { this.username = value; this.OnPropertyChanged("Username"); }
+            get { return this.wsUrl; }
+            set { this.wsUrl = value; this.OnPropertyChanged("WsUrl"); }
         }
-        [Text("Password:", "Password for auth")]
-        public string Password
+
+        [Text("Token:", "Token JSON string")]
+        public string Token
         {
-            get { return this.password; }
-            set { this.password = value; this.OnPropertyChanged("Password"); }
-        }
-        [Text("Info:", "Info JSON string")]
-        public string Info
-        {
-            get { return this.info; }
-            set { this.info = value; this.OnPropertyChanged("Info"); }
-        }
-        [Text("Signature:", "Signature string")]
-        public string Signature
-        {
-            get { return this.signature; }
-            set { this.signature = value; this.OnPropertyChanged("Signature"); }
+            get { return this.token; }
+            set { this.token = value; this.OnPropertyChanged("Token"); }
         }
         [Text("Timeout (ms):", "Timeout in milliseconds")]
         public string Timeout
@@ -136,25 +124,50 @@ namespace WebSocketMessagePack
                 return;
             }
 
-            string username = BlockBase.ReplaceValues(this.Username, data);
-            string password = BlockBase.ReplaceValues(this.Password, data);
-            string signature = BlockBase.ReplaceValues(this.Signature, data);
-            string infoJsonString = BlockBase.ReplaceValues(this.Info, data);
+            string tokenJson = BlockBase.ReplaceValues(this.Token, data);
             string timeoutStr = BlockBase.ReplaceValues(this.Timeout, data);
             int timeout = 30000;
             int.TryParse(timeoutStr, out timeout);
 
-            // Không parse info thành object nữa, chỉ dùng chuỗi JSON
+            // Parse token JSON to extract necessary fields
             string wsToken = "";
-            try
+            string signature = "";
+            string infoJsonString = "";
+            if (!string.IsNullOrWhiteSpace(tokenJson))
             {
-                var infoObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(infoJsonString);
-                if (infoObj != null && infoObj.ContainsKey("wsToken"))
-                    wsToken = infoObj["wsToken"]?.ToString() ?? "";
+                try
+                {
+                    var root = JObject.Parse(tokenJson);
+                    var dataObj = root["data"] as JObject;
+                    if (dataObj != null)
+                    {
+                        wsToken = dataObj["wsToken"]?.ToString() ?? "";
+                        signature = dataObj["signature"]?.ToString() ?? "";
+                        var infoToken = dataObj["info"];
+                        if (infoToken != null && infoToken.Type != JTokenType.Null)
+                        {
+                            infoJsonString = infoToken.Type == JTokenType.String ? infoToken.ToString() : infoToken.ToString(Formatting.None);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    data.Log(new LogEntry($"Invalid token JSON: {ex.Message}", Colors.Red));
+                }
             }
-            catch { }
 
-            string wsUrl = $"wss://websocket.azhkthg1.net/wsbinary?token={wsToken}";
+            if (string.IsNullOrWhiteSpace(wsToken))
+            {
+                throw new ArgumentException("Token does not contain a valid data.wsToken value");
+            }
+
+            string wsUrlBase = BlockBase.ReplaceValues(this.WsUrl, data);
+            if (string.IsNullOrWhiteSpace(wsUrlBase))
+            {
+                data.Log(new LogEntry("WS Url is null or empty", Colors.Red));
+                throw new ArgumentException("WS Url cannot be null or empty");
+            }
+            string wsUrl = wsUrlBase + wsToken;
 
             var resultBuilder = new System.Text.StringBuilder();
             var messageCount = 0;
@@ -184,7 +197,6 @@ namespace WebSocketMessagePack
                     new KeyValuePair<string, string>("Cache-Control", "no-cache"),
                     new KeyValuePair<string, string>("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"),
                     new KeyValuePair<string, string>("Upgrade", "websocket"),
-                    new KeyValuePair<string, string>("Origin", "https://web.sunwin.sx"),
                     new KeyValuePair<string, string>("Sec-WebSocket-Version", "13"),
                     new KeyValuePair<string, string>("Accept-Encoding", "gzip, deflate, br, zstd"),
                     new KeyValuePair<string, string>("Accept-Language", "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5"),
@@ -204,7 +216,7 @@ namespace WebSocketMessagePack
                 {
                     try
                     {
-                        string logMsg = JsonConvert.SerializeObject(new object[] { 1, "MiniGame", username, password, new Dictionary<string, object> { { "info", infoJsonString }, { "signature", signature } } });
+                        string logMsg = JsonConvert.SerializeObject(new object[] { 1, "MiniGame", "", "", new Dictionary<string, object> { { "info", infoJsonString }, { "signature", signature } } });
                         data.Log(new LogEntry($"Sent {logMsg} to the server", Colors.Yellow));
                         // Tạo payload đúng chuẩn
                         var map = new Dictionary<string, object>
@@ -216,8 +228,8 @@ namespace WebSocketMessagePack
                         {
                             1,
                             "MiniGame",
-                            username,
-                            password,
+                            "",
+                            "",
                             map
                         };
                         byte[] binaryPayload = MessagePack.MessagePackSerializer.Serialize(payload);
@@ -478,10 +490,8 @@ namespace WebSocketMessagePack
         {
             BlockWriter writer = new BlockWriter(base.GetType(), indent, base.Disabled);
             writer.Label(base.Label).Token("SocketMessagePack", "")
-                .Literal(this.Username, "")
-                .Literal(this.Password, "")
-                .Literal(this.Info, "")
-                .Literal(this.Signature, "")
+                .Literal(this.WsUrl, "")
+                .Literal(this.Token, "")
                 .Literal(this.Timeout, "");
             if (!writer.CheckDefault(this.VariableName, "VariableName"))
             {
@@ -497,10 +507,8 @@ namespace WebSocketMessagePack
             {
                 base.Label = LineParser.ParseLabel(ref input);
             }
-            this.Username = LineParser.ParseLiteral(ref input, "Username", false, null);
-            this.Password = LineParser.ParseLiteral(ref input, "Password", false, null);
-            this.Info = LineParser.ParseLiteral(ref input, "Info", false, null);
-            this.Signature = LineParser.ParseLiteral(ref input, "Signature", false, null);
+            this.WsUrl = LineParser.ParseLiteral(ref input, "WsUrl", false, null);
+            this.Token = LineParser.ParseLiteral(ref input, "Token", false, null);
             this.Timeout = LineParser.ParseLiteral(ref input, "Timeout", false, null);
             if (LineParser.ParseToken(ref input, TokenType.Arrow, false, true) == "")
             {
