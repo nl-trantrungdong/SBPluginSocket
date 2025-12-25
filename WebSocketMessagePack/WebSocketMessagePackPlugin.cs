@@ -175,11 +175,32 @@ namespace WebSocketMessagePack
                 // Track this connection
                 ActiveConnections.TryAdd(ws, DateTime.Now);
 
+                // Enable WebSocketSharp internal logging for debugging
+                // LogLevel.Trace = hiển thị tất cả debug messages (Trace, Debug, Info, Warn, Error, Fatal)
+                // LogLevel.Debug = chỉ hiển thị Debug và các level cao hơn
+                // LogLevel.Info = chỉ hiển thị Info và các level cao hơn
+                ws.Log.Level = WebSocketSharp.LogLevel.Trace;
+                
+                // Redirect WebSocketSharp internal logs to SilverBullet log system
+                // Điều này giúp xem được các log nội bộ của WebSocketSharp như:
+                // - HTTP handshake requests/responses
+                // - Proxy CONNECT requests
+                // - SSL/TLS handshake details
+                // - WebSocket frame details
+                ws.Log.Output = (logData, file) =>
+                {
+                    string level = logData.Level.ToString();
+                    string message = logData.Message ?? "";
+                    data.Log(new LogEntry($"[WS-{level}] {message}", Colors.Orange));
+                    resultBuilder.AppendLine($"[WS-{level}] {message}");
+                };
+
                 ws.SslConfiguration.EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12;
                 ws.WaitTime = TimeSpan.FromMilliseconds(timeout);
                 ws.CustomHeaders = new[] {
                     new KeyValuePair<string, string>("Host", "websocket.azhkthg1.net"),
                     new KeyValuePair<string, string>("Connection", "Upgrade"),
+                    new KeyValuePair<string, string>("Proxy-Connection", "keep-alive"),
                     new KeyValuePair<string, string>("Pragma", "no-cache"),
                     new KeyValuePair<string, string>("Cache-Control", "no-cache"),
                     new KeyValuePair<string, string>("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"),
@@ -191,11 +212,49 @@ namespace WebSocketMessagePack
                     new KeyValuePair<string, string>("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits")
                 };
 
+                // Configure proxy with detailed logging
                 if (data.UseProxies && data.Proxy != null)
                 {
                     if (!data.Proxy.Type.ToString().Equals("Http", StringComparison.OrdinalIgnoreCase))
-                        throw new NotSupportedException("Only HTTP proxy is supported for WebSocket debug!");
-                    ws.SetProxy("http://" + data.Proxy.Host + ":" + data.Proxy.Port, data.Proxy.Username, data.Proxy.Password);
+                        throw new NotSupportedException("Only HTTP proxy is supported for WebSocket!");
+                    
+                    string proxyHost = data.Proxy.Host ?? "";
+                    string proxyPort = data.Proxy.Port?.ToString() ?? "";
+                    string proxyUsername = data.Proxy.Username ?? "";
+                    string proxyPassword = data.Proxy.Password ?? "";
+                    
+                    // Log proxy information BEFORE setting
+                    data.Log(new LogEntry($"=== Proxy Configuration ===", Colors.Cyan));
+                    data.Log(new LogEntry($"Proxy Host: {proxyHost}", Colors.Cyan));
+                    data.Log(new LogEntry($"Proxy Port: {proxyPort}", Colors.Cyan));
+                    data.Log(new LogEntry($"Proxy Username: {(string.IsNullOrEmpty(proxyUsername) ? "(null/empty)" : proxyUsername)}", Colors.Cyan));
+                    data.Log(new LogEntry($"Proxy Password: {(string.IsNullOrEmpty(proxyPassword) ? "(null/empty)" : "***" + proxyPassword.Length + " chars")}", Colors.Cyan));
+                    
+                    if (string.IsNullOrEmpty(proxyHost) || string.IsNullOrEmpty(proxyPort))
+                    {
+                        throw new ArgumentException("Proxy host and port cannot be empty!");
+                    }
+                    
+                    string proxyUrl = "http://" + proxyHost + ":" + proxyPort;
+                    
+                    // Set proxy and log the result
+                    if (!string.IsNullOrEmpty(proxyUsername) && !string.IsNullOrEmpty(proxyPassword))
+                    {
+                        ws.SetProxy(proxyUrl, proxyUsername, proxyPassword);
+                        data.Log(new LogEntry($"✅ Proxy set with authentication: {proxyUrl}", Colors.Green));
+                        data.Log(new LogEntry($"   Username: {proxyUsername}, Password: {proxyPassword.Length} characters", Colors.Green));
+                        resultBuilder.AppendLine($"PROXY: {proxyUrl}");
+                        resultBuilder.AppendLine($"PROXY_USER: {proxyUsername}");
+                        resultBuilder.AppendLine($"PROXY_PASS_LENGTH: {proxyPassword.Length}");
+                    }
+                    else
+                    {
+                        ws.SetProxy(proxyUrl, "", "");
+                        data.Log(new LogEntry($"⚠️ Proxy set WITHOUT authentication: {proxyUrl}", Colors.Yellow));
+                        data.Log(new LogEntry($"   Username is null/empty: {string.IsNullOrEmpty(proxyUsername)}", Colors.Yellow));
+                        data.Log(new LogEntry($"   Password is null/empty: {string.IsNullOrEmpty(proxyPassword)}", Colors.Yellow));
+                        resultBuilder.AppendLine($"PROXY: {proxyUrl} (NO AUTH)");
+                    }
                 }
 
                 data.Log(new LogEntry($"The Web Socket client connected to {wsUrl}", Colors.Cyan));
@@ -291,9 +350,39 @@ namespace WebSocketMessagePack
                 ws.OnError += (s, e) =>
                 {
                     string err = $"WebSocket Error: {e.Message}";
+                    if (e.Exception != null)
+                    {
+                        err += $"\nException Type: {e.Exception.GetType().Name}";
+                        err += $"\nException Message: {e.Exception.Message}";
+                        
+                        // Check for specific proxy-related errors
+                        if (e.Exception.Message.Contains("EndOfStreamException") || 
+                            e.Exception.Message.Contains("header could not be read"))
+                        {
+                            err += "\n\n⚠️ PROXY ISSUE DETECTED:";
+                            err += "\n  - Proxy may not be responding to CONNECT request";
+                            err += "\n  - Proxy may have closed connection unexpectedly";
+                            err += "\n  - Proxy may not support WebSocket CONNECT method";
+                            err += "\n  - WebSocketSharp only sends Proxy-Authorization AFTER receiving 407";
+                            err += "\n  - Some proxies require authentication in the FIRST CONNECT request";
+                            err += "\n  - SOLUTION: Modify websocket-sharp source code to send Proxy-Authorization";
+                            err += "\n    header immediately if credentials are provided";
+                            err += "\n  - Location: websocket-sharp/HttpRequest.CreateConnectRequest()";
+                            err += "\n  - Try a different proxy or check proxy configuration";
+                        }
+                        
+                        if (e.Exception.InnerException != null)
+                        {
+                            err += $"\nInner Exception: {e.Exception.InnerException.GetType().Name}: {e.Exception.InnerException.Message}";
+                        }
+                    }
                     data.Log(new LogEntry(err, Colors.Red));
                     wsException = e.Exception ?? new Exception(e.Message);
                     resultBuilder.AppendLine(" | ERROR: " + e.Message);
+                    if (e.Exception != null)
+                    {
+                        resultBuilder.AppendLine(" | EXCEPTION_TYPE: " + e.Exception.GetType().Name);
+                    }
                     SafeCloseWebSocket(ws);
                     doneEvent.Set();
                 };
